@@ -9,11 +9,18 @@ const VOLUME_BUTTON_SELECTOR = [
 ].join(', ')
 const VOLUME_BAR_SELECTOR =
   '.player-bar-container, .lyric-bar, .playerbar-action-popover-proxy'
+const POPOVER_TRIGGER_SELECTOR = '.echo-popover-trigger'
+// VolumePopover 的弹层经 reka-ui Portal 挂到 body，内容根节点带有 vol-popover 类。
+const VOLUME_POPOVER_CONTENT_SELECTOR = '.echo-popover-content.vol-popover'
 const WHEEL_NOTCH = 100
 const DISCRETE_WHEEL_THRESHOLD = 60
 const DEFAULT_STEP = 5
 const MIN_STEP = 1
 const MAX_STEP = 20
+// 悬停弹出与移开隐藏的延迟，与宿主 hover 弹层的手感保持一致，
+// 也容忍鼠标从按钮滑向弹层时经过的 8px 空隙。
+const HOVER_OPEN_DELAY = 100
+const HOVER_HIDE_DELAY = 100
 
 const isMacPlatform = () => {
   const platform = navigator.userAgentData?.platform || navigator.platform || ''
@@ -119,6 +126,128 @@ export default async function (ctx) {
   window.addEventListener('wheel', handleWheel, { capture: true, passive: false })
   ctx.dispose(() => window.removeEventListener('wheel', handleWheel, { capture: true }))
 
+  // ===== 悬停弹出音量条 =====
+  // 宿主弹层由 trigger="click" 驱动，插件改不了其 props，只能用合成点击模拟开合：
+  // 开合状态从触发器包装元素（.echo-popover-trigger）的 aria-expanded 读取，
+  // 真实点击则在捕获阶段被劫持为静音切换（见下方 handleClickCapture）。
+  let openTimer = null
+  let closeTimer = null
+  let pendingOpenButton = null
+
+  const dispatchSyntheticClick = (button) => {
+    button.dispatchEvent(
+      new MouseEvent('click', { bubbles: true, cancelable: true, view: window }),
+    )
+  }
+
+  const clearHoverTimers = () => {
+    if (openTimer !== null) {
+      clearTimeout(openTimer)
+      openTimer = null
+      pendingOpenButton = null
+    }
+    if (closeTimer !== null) {
+      clearTimeout(closeTimer)
+      closeTimer = null
+    }
+  }
+
+  ctx.dispose(clearHoverTimers)
+
+  const isVolumePopoverOpen = (button) => {
+    const expanded = button?.closest(POPOVER_TRIGGER_SELECTOR)?.getAttribute('aria-expanded')
+    if (expanded !== null && expanded !== undefined) return expanded === 'true'
+    // 老版本未在触发器上写 aria-expanded 时，退回看弹层自身状态。
+    return Boolean(document.querySelector(`${VOLUME_POPOVER_CONTENT_SELECTOR}[data-state="open"]`))
+  }
+
+  const findOpenVolumeButton = () => {
+    for (const button of document.querySelectorAll(VOLUME_BUTTON_SELECTOR)) {
+      if (button.closest(POPOVER_TRIGGER_SELECTOR)?.getAttribute('aria-expanded') === 'true') {
+        return button
+      }
+    }
+    return null
+  }
+
+  const isInsidePopoverContent = (target) =>
+    target instanceof Element && Boolean(target.closest(VOLUME_POPOVER_CONTENT_SELECTOR))
+
+  const isInsideHoverZone = (target) =>
+    Boolean(resolveVolumeButton(target)) || isInsidePopoverContent(target)
+
+  const cancelCloseTimer = () => {
+    if (closeTimer === null) return
+    clearTimeout(closeTimer)
+    closeTimer = null
+  }
+
+  const cancelOpenTimer = () => {
+    if (openTimer === null) return
+    clearTimeout(openTimer)
+    openTimer = null
+    pendingOpenButton = null
+  }
+
+  const handleMouseOver = (event) => {
+    if (!isInsideHoverZone(event.target)) return
+    // 回到按钮或弹层即取消隐藏；穿过按钮与弹层之间的空隙也不会闪关。
+    cancelCloseTimer()
+
+    const button = resolveVolumeButton(event.target)
+    if (!button || isVolumePopoverOpen(button)) return
+    // 同一按钮上已有计时不重置，避免在按钮内部子元素间移动导致永远打不开。
+    if (pendingOpenButton === button && openTimer !== null) return
+    cancelOpenTimer()
+
+    pendingOpenButton = button
+    openTimer = setTimeout(() => {
+      openTimer = null
+      const target = pendingOpenButton
+      pendingOpenButton = null
+      if (target?.isConnected && !isVolumePopoverOpen(target)) {
+        dispatchSyntheticClick(target)
+      }
+    }, HOVER_OPEN_DELAY)
+  }
+
+  const handleMouseOut = (event) => {
+    if (!isInsideHoverZone(event.target)) return
+    // relatedTarget 仍落在按钮或弹层内（含两者之间的空隙过渡）时不隐藏。
+    if (isInsideHoverZone(event.relatedTarget)) return
+
+    cancelOpenTimer()
+    if (closeTimer !== null) return
+    closeTimer = setTimeout(() => {
+      closeTimer = null
+      const openButton = findOpenVolumeButton()
+      if (openButton) dispatchSyntheticClick(openButton)
+    }, HOVER_HIDE_DELAY)
+  }
+
+  window.addEventListener('mouseover', handleMouseOver, { capture: true })
+  window.addEventListener('mouseout', handleMouseOut, { capture: true })
+  ctx.dispose(() => {
+    window.removeEventListener('mouseover', handleMouseOver, { capture: true })
+    window.removeEventListener('mouseout', handleMouseOut, { capture: true })
+  })
+
+  // ===== 点击触发按钮改为切换静音 =====
+  // 只拦截用户真实点击（isTrusted），放行上方用于开合弹层的合成点击；
+  // 捕获阶段先于宿主触发器的 click 处理器，阻止其继续把弹层开关。
+  const handleClickCapture = (event) => {
+    if (!event.isTrusted) return
+    if (!resolveVolumeButton(event.target)) return
+
+    event.preventDefault()
+    event.stopPropagation()
+    clearHoverTimers()
+    void ctx.player.store.toggleMute()
+  }
+
+  window.addEventListener('click', handleClickCapture, { capture: true })
+  ctx.dispose(() => window.removeEventListener('click', handleClickCapture, { capture: true }))
+
   const SettingsPanel = defineComponent({
     setup() {
       const stepLabel = computed(() => `${settings.step}%`)
@@ -201,7 +330,7 @@ export default async function (ctx) {
               style:
                 'margin: 0; font-size: 12px; line-height: 1.6; color: var(--color-text-secondary);',
             },
-            '将鼠标移到主播放栏或歌词页底部的音量按钮上滚动滚轮即可调节音量。',
+            '鼠标悬停在主播放栏或歌词页底部的音量按钮上即可弹出音量条，移开后自动隐藏；点击按钮切换静音，在按钮上滚动滚轮直接调节音量。',
           ),
         ])
     },
@@ -210,7 +339,7 @@ export default async function (ctx) {
   ctx.ui.settings.define({
     id: 'default',
     title: '滚轮音量调节',
-    description: '调节滚轮步进与方向，修改后立即生效。',
+    description: '悬停弹出音量条、点击切换静音，滚轮步进与方向在此调整。',
     component: SettingsPanel,
   })
 }
